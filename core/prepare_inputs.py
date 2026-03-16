@@ -24,8 +24,8 @@ from boltz.data import const
 from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.csv import parse_csv
-from boltz.data.parse.mmcif import parse_mmcif
-from boltz.data.types import ChainInfo, Manifest, Record
+from boltz.data.parse.mmcif_with_constraints import parse_mmcif
+from boltz.data.types import ChainInfo, Manifest, Record, TemplateInfo
 
 
 STRUCT_EXTS = {".pdb", ".ent", ".cif", ".mmcif"}
@@ -394,8 +394,28 @@ def _build_custom_ligand_mol(residue: gemmi.Residue) -> Chem.Mol:
 
     # Try to infer bonds from coordinates; fall back to no bonds on failure.
     mol = _assign_bond_orders(mol)
+    _finalize_custom_mol(mol)
 
     return mol
+
+
+def _finalize_custom_mol(mol: Chem.Mol) -> None:
+    """Ensure RDKit caches are populated for downstream geometry constraint generation."""
+    try:
+        mol.UpdatePropertyCache(strict=False)
+    except Exception:
+        pass
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        try:
+            Chem.GetSymmSSSR(mol)
+        except Exception:
+            pass
+        try:
+            mol.UpdatePropertyCache(strict=False)
+        except Exception:
+            pass
 
 
 def _build_custom_ligand_mol_from_smiles(
@@ -457,6 +477,7 @@ def _build_custom_ligand_mol_from_smiles(
     assigned.SetProp("_Name", resname)
     assigned.SetProp("name", resname)
     assigned.SetProp("id", resname)
+    _finalize_custom_mol(assigned)
     return assigned
 
 
@@ -498,6 +519,7 @@ def _build_custom_ligand_mol_from_smiles_with_reference(
     assigned.SetProp("_Name", resname)
     assigned.SetProp("name", resname)
     assigned.SetProp("id", resname)
+    _finalize_custom_mol(assigned)
     return assigned
 
 
@@ -641,6 +663,7 @@ def _build_custom_ligand_mol_from_pdb(
     mol.SetProp("_Name", resname)
     mol.SetProp("name", resname)
     mol.SetProp("id", resname)
+    _finalize_custom_mol(mol)
     return mol
 
 
@@ -868,6 +891,80 @@ def _collect_custom_ligands(
     return custom_mols
 
 
+def _collect_custom_polymer_residues(
+    path: Path,
+    mols: dict,
+    mol_dir: Path,
+) -> dict[str, Chem.Mol]:
+    """Collect custom polymer residue definitions when CCD entries do not match input atoms."""
+    structure = gemmi.read_structure(str(path))
+    structure.setup_entities()
+
+    entity_types = {
+        sub: ent.entity_type.name
+        for ent in structure.entities
+        for sub in ent.subchains
+    }
+
+    pdb_lines = None
+    if path.suffix.lower() in {".pdb", ".ent"}:
+        try:
+            pdb_lines = path.read_text().splitlines()
+        except Exception:
+            pdb_lines = None
+
+    custom_mols: dict[str, Chem.Mol] = {}
+
+    for chain in structure[0]:
+        for residue in chain:
+            sub = residue.subchain
+            if entity_types.get(sub) != "Polymer":
+                continue
+            resname = residue.name.strip()
+            if not resname or resname in const.tokens:
+                continue
+
+            ccd_mol = _get_cached_mol(mols, mol_dir, resname)
+            ccd_matches = _ccd_matches_residue(residue, ccd_mol) if ccd_mol else False
+            if ccd_matches:
+                continue
+
+            if resname in custom_mols:
+                continue
+
+            custom_mol = None
+            if pdb_lines:
+                extracted = _extract_pdb_ligand_block(
+                    pdb_lines=pdb_lines,
+                    resname=resname,
+                    chain_id=chain.name,
+                    resseq=residue.seqid.num,
+                    icode=residue.seqid.icode,
+                )
+                if extracted:
+                    pdb_block, atom_lines = extracted
+                    custom_mol = _build_custom_ligand_mol_from_pdb(
+                        pdb_block=pdb_block,
+                        het_lines=atom_lines,
+                        resname=resname,
+                    )
+            if custom_mol is None:
+                custom_mol = _build_custom_ligand_mol(residue)
+
+            mapping_stats = _atom_name_mapping_stats(residue, custom_mol)
+            matched = int(mapping_stats["matched"])
+            residue_total = int(mapping_stats["residue_total"])
+            mol_total = int(mapping_stats["mol_total"])
+            print(
+                f"[Info] Built custom polymer residue {resname} "
+                f"(atoms={custom_mol.GetNumAtoms()}, bonds={custom_mol.GetNumBonds()}, "
+                f"mapped_heavy_atoms={matched}/{max(residue_total, mol_total)})."
+            )
+            custom_mols[resname] = custom_mol
+
+    return custom_mols
+
+
 def _iter_struct_files(input_dir: Path, recursive: bool) -> List[Path]:
     if recursive:
         files = [p for p in input_dir.rglob("*") if p.suffix.lower() in STRUCT_EXTS]
@@ -899,7 +996,7 @@ def _parse_structure(path: Path, mols: dict, mol_dir: Path):
             mols=mols,
             moldir=str(mol_dir),
             use_assembly=False,
-            compute_interfaces=False,
+            call_compute_interfaces=False,
         )
     raise ValueError(f"Unsupported structure format: {path}")
 
@@ -947,11 +1044,16 @@ def _parse_pdb_with_sequence(path: Path, mols: dict, mol_dir: Path):
             mols=mols,
             moldir=str(mol_dir),
             use_assembly=False,
-            compute_interfaces=False,
+            call_compute_interfaces=False,
         )
 
 
-def _build_record(target_id: str, parsed) -> Record:
+def _build_record(
+    target_id: str,
+    parsed,
+    self_template: bool = False,
+    self_template_threshold: float = 2.0,
+) -> Record:
     chains = parsed.data.chains
     chain_infos = []
     for chain in chains:
@@ -972,13 +1074,38 @@ def _build_record(target_id: str, parsed) -> Record:
     if struct_info.num_chains is None:
         struct_info = replace(struct_info, num_chains=len(chains))
 
+    template_records = None
+    if self_template:
+        template_rows: list[TemplateInfo] = []
+        for chain in chains:
+            if int(chain["mol_type"]) != PROTEIN_CHAIN_TYPE:
+                continue
+            chain_name = str(chain["name"])
+            num_residues = int(chain["res_num"])
+            if num_residues <= 0:
+                continue
+            template_rows.append(
+                TemplateInfo(
+                    name="self",
+                    query_chain=chain_name,
+                    query_st=1,
+                    query_en=num_residues,
+                    template_chain=chain_name,
+                    template_st=1,
+                    template_en=num_residues,
+                    force=True,
+                    threshold=float(self_template_threshold),
+                )
+            )
+        template_records = template_rows or None
+
     return Record(
         id=target_id,
         structure=struct_info,
         chains=chain_infos,
         interfaces=[],
         inference_options=None,
-        templates=None,
+        templates=template_records,
         md=None,
         affinity=None,
     )
@@ -996,16 +1123,23 @@ def prepare_inputs(
     msa_pairing_strategy: str = "greedy",
     max_msa_seqs: int = 8192,
     msa_cache_dir: Path | None = DEFAULT_MSA_CACHE_DIR,
+    self_template: bool = False,
+    self_template_threshold: float = 2.0,
 ) -> Tuple[Manifest, List[Path]]:
     struct_dir = out_dir / "processed" / "structures"
     records_dir = out_dir / "processed" / "records"
+    constraints_dir = out_dir / "processed" / "constraints"
     msa_dir = out_dir / "processed" / "msa"
     mols_dir = out_dir / "processed" / "mols"
+    template_dir = out_dir / "processed" / "templates"
 
     struct_dir.mkdir(parents=True, exist_ok=True)
     records_dir.mkdir(parents=True, exist_ok=True)
+    constraints_dir.mkdir(parents=True, exist_ok=True)
     msa_dir.mkdir(parents=True, exist_ok=True)
     mols_dir.mkdir(parents=True, exist_ok=True)
+    if self_template:
+        template_dir.mkdir(parents=True, exist_ok=True)
 
     mol_dir = cache_dir / "mols"
     if not mol_dir.exists():
@@ -1037,6 +1171,13 @@ def prepare_inputs(
                 preloaded_custom_mols=preloaded_custom_mols,
                 ligand_smiles_map=ligand_smiles_map,
             )
+            polymer_custom_mols = _collect_custom_polymer_residues(
+                path,
+                mols,
+                mol_dir,
+            )
+            if polymer_custom_mols:
+                custom_mols.update(polymer_custom_mols)
             if custom_mols:
                 for name, mol in custom_mols.items():
                     if name in mols:
@@ -1044,7 +1185,12 @@ def prepare_inputs(
                     mols[name] = mol
 
             parsed = _parse_structure(path, mols=mols, mol_dir=mol_dir)
-            record = _build_record(target_id, parsed)
+            record = _build_record(
+                target_id,
+                parsed,
+                self_template=self_template,
+                self_template_threshold=self_template_threshold,
+            )
             _attach_msa_to_record(
                 parsed=parsed,
                 record=record,
@@ -1058,6 +1204,10 @@ def prepare_inputs(
             )
             # Dump structure and record
             parsed.data.dump(struct_dir / f"{target_id}.npz")
+            if record.templates:
+                parsed.data.dump(template_dir / f"{target_id}_self.npz")
+            if getattr(parsed, "residue_constraints", None) is not None:
+                parsed.residue_constraints.dump(constraints_dir / f"{target_id}.npz")
             record.dump(records_dir / f"{target_id}.json")
 
             # Collect extra molecules (ligands) not guaranteed in mol cache
@@ -1137,6 +1287,17 @@ def main() -> None:
         default=str(DEFAULT_MSA_CACHE_DIR),
         help="Cache directory for sequence-keyed .a3m files.",
     )
+    parser.add_argument(
+        "--self_template",
+        action="store_true",
+        help="Inject the input protein structure as a forced Boltz2 template.",
+    )
+    parser.add_argument(
+        "--self_template_threshold",
+        type=float,
+        default=2.0,
+        help="Flat-bottom threshold in angstroms used by the forced self-template.",
+    )
 
     args = parser.parse_args()
 
@@ -1156,6 +1317,8 @@ def main() -> None:
         msa_pairing_strategy=args.msa_pairing_strategy,
         max_msa_seqs=max(1, int(args.max_msa_seqs)),
         msa_cache_dir=Path(args.msa_cache_dir).expanduser().resolve() if args.msa_cache_dir else None,
+        self_template=bool(args.self_template),
+        self_template_threshold=float(args.self_template_threshold),
     )
 
     print(f"Prepared {len(manifest.records)} inputs in {out_dir / 'processed'}")
