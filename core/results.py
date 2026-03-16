@@ -181,7 +181,7 @@ def rerank_diffusion_samples(
         "weights": {
             "ligand_ipsae_max": 0.30,
             "ipsae_dom": 0.25,
-            "iptm": 0.20,
+            "iptm": 0.17,
             "ligand_iptm": 0.10,
             "ligand_plddt_mean_normalized": 0.06,
             "ligand_atom_plddt_p10_normalized": 0.05,

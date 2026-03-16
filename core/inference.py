@@ -191,7 +191,7 @@ def _sample_with_optional_input_init(
                         energy += parameters["resampling_weight"] * component_energy
                 energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
 
-                if step_idx == 0:
+                if step_idx == 0 or energy_traj.shape[1] < 2:
                     log_G = -1 * energy
                 else:
                     log_G = energy_traj[:, -2] - energy_traj[:, -1]
