@@ -296,6 +296,16 @@ def configure_anchored_refine_constraints(
             ligand_chain = next(
                 chain for chain in structure.chains if int(chain["asym_id"]) == ligand_candidates[0][0]
             )
+        elif not requested_ligand_chain_id:
+            preferred_candidates = [
+                (asym_id, chain_name)
+                for asym_id, chain_name in ligand_candidates
+                if str(chain_name or "").strip().upper().startswith("L")
+            ]
+            if len(preferred_candidates) == 1:
+                ligand_chain = next(
+                    chain for chain in structure.chains if int(chain["asym_id"]) == preferred_candidates[0][0]
+                )
         elif requested_ligand_chain_id:
             raise RuntimeError(
                 "Failed to resolve ligand chain for anchored refinement. "

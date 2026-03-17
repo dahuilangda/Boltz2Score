@@ -7,11 +7,11 @@ from pathlib import Path
 
 from rdkit import Chem
 
+from core.affinity import prepare_affinity_record, run_affinity_prediction
 from core.cli import ExecutionPlan, JobSpec
 from core.inference import run_scoring
 from core.results import compute_and_write_ipsae, rerank_diffusion_samples, write_chain_map
 from core.prepare_inputs import prepare_inputs
-from utils.affinity_utils import run_affinity_prediction
 from utils.ligand_utils import build_combined_input_from_parts, slugify_identifier
 from utils.score_diagnostics import write_atom_coverage_diagnostics
 from utils.structure_refinement import (
@@ -60,6 +60,11 @@ def run_single_job(
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
 
+    resolved_ligand_chain_id = plan.ligand_chains[0] if plan.ligand_chains else None
+    if resolved_ligand_chain_id is None and reference_ligand_mol_for_alignment is not None:
+        # Separate protein+ligand inputs are merged by staging the explicit ligand as chain L.
+        resolved_ligand_chain_id = "L"
+
     if plan.run_affinity:
         shared_subset_input = work_dir / f"{record_id}_shared_subset.cif"
         filter_structure_by_chains(
@@ -105,6 +110,21 @@ def run_single_job(
         self_template_threshold=args.self_template_threshold,
     )
 
+    if plan.run_affinity:
+        affinity_summary = prepare_affinity_record(
+            processed_dir=work_dir / "processed",
+            cache_dir=plan.cache_dir,
+            record_id=record_id,
+            requested_ligand_chain_id=resolved_ligand_chain_id,
+            reference_ligand_mol=reference_ligand_mol_for_alignment,
+        )
+        print(
+            "[Info] Prepared Boltz2 affinity metadata: "
+            f"ligand_chain={affinity_summary['ligand_chain_name']} "
+            f"(chain_id={affinity_summary['ligand_chain_id']}), "
+            f"ligand_mw={affinity_summary['ligand_mw']:.3f}."
+        )
+
     anchored_guidance_enabled = False
     reference_from_input_enabled = bool(plan.structure_refine and args.reference_from_input)
     sampling_init_from_input_enabled = bool(plan.structure_refine and args.sampling_init_from_input)
@@ -112,7 +132,7 @@ def run_single_job(
         anchored_summary = configure_anchored_refine_constraints(
             processed_dir=work_dir / "processed",
             record_id=record_id,
-            requested_ligand_chain_id=plan.ligand_chains[0] if plan.ligand_chains else None,
+            requested_ligand_chain_id=resolved_ligand_chain_id,
             requested_target_chains=plan.target_chains,
             contact_cutoff=args.anchor_contact_cutoff,
             max_distance=args.anchor_max_distance,
@@ -185,7 +205,7 @@ def run_single_job(
         processed_dir=work_dir / "processed",
         output_dir=plan.output_dir,
         record_id=record_id,
-        requested_ligand_chain_id=plan.ligand_chains[0] if plan.ligand_chains else None,
+        requested_ligand_chain_id=resolved_ligand_chain_id,
         ligand_smiles_map=resolved_ligand_smiles_map if resolved_ligand_smiles_map else None,
         reference_ligand_mol=reference_ligand_mol_for_alignment,
     )
@@ -209,16 +229,17 @@ def run_single_job(
         )
 
     if plan.run_affinity:
-        print(f"[Info] Affinity input source locked to scoring input path: {staged_input}")
         run_affinity_prediction(
-            complex_file=staged_input,
+            processed_dir=work_dir / "processed",
             output_dir=plan.output_dir,
             cache_dir=plan.cache_dir,
-            result_id=record_id,
+            record_id=record_id,
             accelerator=args.accelerator,
             devices=args.devices,
             affinity_refine=args.affinity_refine,
+            checkpoint=None,
             seed=args.seed,
-            work_dir=work_dir,
+            num_workers=args.num_workers,
+            trainer_precision=args.trainer_precision,
             ligand_alignment=ligand_alignment,
         )

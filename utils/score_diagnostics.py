@@ -13,6 +13,7 @@ from utils.ligand_alignment import (
     ligand_atom_plddt_stats,
     load_raw_ligand_plddt_entries,
     resolve_model_ligand_chain_id,
+    resolve_model_ligand_chain_id_from_atom_names,
 )
 
 
@@ -100,13 +101,16 @@ def write_atom_coverage_diagnostics(
                 for item in coverage.get("ligand_atom_coverage", [])
                 if isinstance(item, dict) and str(item.get("chain") or "").strip()
             ]
-            aligned_ligand_chain_id = resolve_model_ligand_chain_id(
-                ligand_chains,
-                requested_ligand_chain_id,
-            )
             aligned_ligand_smiles, smiles_to_heavy, heavy_name_keys = build_smiles_order_from_ligand_mol(
                 reference_ligand_mol
             )
+            try:
+                aligned_ligand_chain_id = resolve_model_ligand_chain_id(
+                    ligand_chains,
+                    requested_ligand_chain_id,
+                )
+            except RuntimeError:
+                aligned_ligand_chain_id = ""
 
         normalized_map: dict[str, str] = {}
         if isinstance(ligand_smiles_map, dict) and ligand_smiles_map:
@@ -166,12 +170,21 @@ def write_atom_coverage_diagnostics(
                         f"Cannot find structure file for confidence: {conf_path.name}"
                     )
                 by_chain = extract_ligand_bfactors_by_chain(structure_file)
-                if aligned_ligand_chain_id not in by_chain:
+                resolved_chain_id = aligned_ligand_chain_id
+                if not resolved_chain_id:
+                    resolved_chain_id = resolve_model_ligand_chain_id_from_atom_names(
+                        by_chain,
+                        heavy_name_keys,
+                        requested_ligand_chain_id,
+                    )
+                    aligned_ligand_chain_id = resolved_chain_id
+                    model_ligand_chain_id = resolved_chain_id
+                if resolved_chain_id not in by_chain:
                     raise RuntimeError(
                         "Model ligand chain not found in structure for confidence alignment: "
-                        f"{aligned_ligand_chain_id}. Available: {sorted(by_chain.keys())}."
+                        f"{resolved_chain_id}. Available: {sorted(by_chain.keys())}."
                     )
-                bfactor_by_name = by_chain[aligned_ligand_chain_id]
+                bfactor_by_name = by_chain[resolved_chain_id]
                 heavy_bfactors: list[float] = []
                 missing_name_keys: list[str] = []
                 for key in heavy_name_keys:
@@ -210,24 +223,24 @@ def write_atom_coverage_diagnostics(
                 raw_entries_by_chain = load_raw_ligand_plddt_entries(
                     struct_dir / f"raw_ligand_atom_plddts_{struct_stem}.json"
                 )
-                model_order_entries = raw_entries_by_chain.get(aligned_ligand_chain_id, [])
+                model_order_entries = raw_entries_by_chain.get(resolved_chain_id, [])
 
-                data["model_ligand_chain_id"] = model_ligand_chain_id
+                data["model_ligand_chain_id"] = resolved_chain_id
                 data["ligand_atom_plddts_by_chain"] = {
-                    model_ligand_chain_id: aligned_ligand_plddts_input_order
+                    resolved_chain_id: aligned_ligand_plddts_input_order
                 }
                 if aligned_ligand_atom_name_keys_input_order:
                     data["ligand_atom_names"] = aligned_ligand_atom_name_keys_input_order
                     data["ligand_atom_name_keys"] = aligned_ligand_atom_name_keys_input_order
                     data["ligand_atom_name_keys_by_chain"] = {
-                        model_ligand_chain_id: aligned_ligand_atom_name_keys_input_order
+                        resolved_chain_id: aligned_ligand_atom_name_keys_input_order
                     }
                     data["ligand_atom_names_by_chain"] = {
-                        model_ligand_chain_id: aligned_ligand_atom_name_keys_input_order
+                        resolved_chain_id: aligned_ligand_atom_name_keys_input_order
                     }
                 if aligned_ligand_atom_plddts_by_name:
                     data["ligand_atom_plddts_by_chain_and_name"] = {
-                        model_ligand_chain_id: aligned_ligand_atom_plddts_by_name
+                        resolved_chain_id: aligned_ligand_atom_plddts_by_name
                     }
                 data["ligand_atom_plddts"] = aligned_ligand_plddts_input_order
                 data["ligand_atom_input_order_names"] = aligned_ligand_atom_name_keys_input_order

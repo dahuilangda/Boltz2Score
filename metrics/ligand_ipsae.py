@@ -315,6 +315,7 @@ def compute_ligand_ipsae_from_files(
 
     ligand_plddts = confidence.get("ligand_atom_plddts") or []
     ligand_plddt_mean = float(np.mean(ligand_plddts)) if ligand_plddts else math.nan
+    ligand_ipsae_max = max(protein_to_ligand, ligand_to_protein)
 
     return {
         "result_dir": str((result_dir or confidence_path.parent).resolve()),
@@ -331,7 +332,7 @@ def compute_ligand_ipsae_from_files(
         "ipsae_dom": ipsae_dom,
         "protein_to_ligand_ipsae": protein_to_ligand,
         "ligand_to_protein_ipsae": ligand_to_protein,
-        "ligand_ipsae_max": max(protein_to_ligand, ligand_to_protein),
+        "ligand_ipsae_max": ligand_ipsae_max,
         "mean_interface_pae": mean_interface_pae,
         "mean_interface_distance": mean_interface_dist,
         "best_protein_token": protein_tokens[best_protein_index].label,

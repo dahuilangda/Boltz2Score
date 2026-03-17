@@ -172,6 +172,68 @@ def resolve_model_ligand_chain_id(
     )
 
 
+def resolve_model_ligand_chain_id_from_atom_names(
+    by_chain: dict[str, dict[str, float]],
+    reference_atom_name_keys: Sequence[str],
+    requested_ligand_chain_id: str | None,
+) -> str:
+    available_chain_ids = sorted(str(chain_id).strip() for chain_id in by_chain if str(chain_id).strip())
+    try:
+        return resolve_model_ligand_chain_id(available_chain_ids, requested_ligand_chain_id)
+    except RuntimeError:
+        pass
+
+    reference_keys = {
+        normalize_name_key(name)
+        for name in reference_atom_name_keys
+        if normalize_name_key(name)
+    }
+    if not reference_keys:
+        raise RuntimeError(
+            "Unable to resolve model ligand chain id uniquely without reference atom names. "
+            f"Available ligand chains: {available_chain_ids}. "
+            f"Requested chain: {requested_ligand_chain_id!r}."
+        )
+
+    exact_matches: list[str] = []
+    containing_matches: list[str] = []
+    scored: list[tuple[int, int, int, int, str]] = []
+    for chain_id in available_chain_ids:
+        model_keys = {
+            normalize_name_key(name)
+            for name in by_chain.get(chain_id, {})
+            if normalize_name_key(name)
+        }
+        if not model_keys:
+            continue
+        if model_keys == reference_keys:
+            exact_matches.append(chain_id)
+        if reference_keys.issubset(model_keys):
+            containing_matches.append(chain_id)
+        overlap = len(reference_keys & model_keys)
+        missing = len(reference_keys - model_keys)
+        extra = len(model_keys - reference_keys)
+        preferred_chain = int(chain_id.upper().startswith("L"))
+        scored.append((overlap, -missing, -extra, preferred_chain, chain_id))
+
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(containing_matches) == 1:
+        return containing_matches[0]
+
+    if scored:
+        scored.sort(reverse=True)
+        best = scored[0]
+        if len(scored) == 1 or best[:4] != scored[1][:4]:
+            return best[4]
+
+    raise RuntimeError(
+        "Unable to resolve model ligand chain id uniquely. "
+        f"Available ligand chains: {available_chain_ids}. "
+        f"Requested chain: {requested_ligand_chain_id!r}."
+    )
+
+
 def build_smiles_order_from_ligand_mol(mol: Chem.Mol) -> tuple[str, list[int], list[str]]:
     heavy = Chem.RemoveHs(Chem.Mol(mol), sanitize=False)
     if heavy.GetNumAtoms() == 0:
