@@ -136,7 +136,6 @@ def _build_trial_command(
     _append_cli_flag(cmd, "--compute_ipsae", args.compute_ipsae)
     _append_cli_flag(cmd, "--keep_work", args.keep_work)
     _append_cli_flag(cmd, "--enable_affinity", args.enable_affinity)
-    _append_cli_flag(cmd, "--auto_enable_affinity", args.auto_enable_affinity)
     _append_cli_flag(cmd, "--affinity_refine", args.affinity_refine)
     _append_cli_flag(cmd, "--use_msa_server", args.use_msa_server)
     cmd.append("--anchored_refine")

@@ -87,11 +87,13 @@ python boltz2score.py \
   --protein_file data/cdk8/5hnb-chainA-prepared.pdb \
   --ligand_file data/cdk8/ligands.sdf \
   --output_dir results/cdk8_affinity \
+  --enable_affinity \
   --target_chain A \
   --ligand_chain L
 ```
 
 Use `--affinity_refine` if you want the official Boltz2 affinity head to run on a refined pre-affinity structure instead of the default fast path.
+Affinity runs only when you explicitly pass `--enable_affinity` together with `--target_chain` and `--ligand_chain`, and is currently supported only for protein-small-molecule complexes. Other input types still run normal Boltz2Score scoring/refinement, but skip affinity.
 
 ## Inputs
 

@@ -17,6 +17,16 @@ from utils.ligand_alignment import (
 )
 
 
+def _canonicalize_smiles_text(smiles: str) -> str:
+    text = str(smiles or "").strip()
+    if not text:
+        return ""
+    mol = Chem.MolFromSmiles(text)
+    if mol is None:
+        return text
+    return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+
+
 def _collect_atom_coverage(processed_dir: Path, record_id: str) -> dict:
     """Collect per-chain atom presence diagnostics from processed inputs."""
     structure = StructureV2.load(processed_dir / "structures" / f"{record_id}.npz")
@@ -112,13 +122,13 @@ def write_atom_coverage_diagnostics(
             except RuntimeError:
                 aligned_ligand_chain_id = ""
 
-        normalized_map: dict[str, str] = {}
+        input_smiles_map: dict[str, str] = {}
         if isinstance(ligand_smiles_map, dict) and ligand_smiles_map:
             for key, value in ligand_smiles_map.items():
                 key_norm = str(key or "").strip()
-                value_norm = str(value or "").strip()
+                value_norm = _canonicalize_smiles_text(str(value or "").strip())
                 if key_norm and value_norm:
-                    normalized_map[key_norm] = value_norm
+                    input_smiles_map[key_norm] = value_norm
 
         requested_chain = ""
         if requested_ligand_chain_id:
@@ -132,23 +142,37 @@ def write_atom_coverage_diagnostics(
                 model_ligand_chain_id = detected_ligand_chains[0]
 
         if aligned_ligand_smiles:
-            if aligned_ligand_chain_id and aligned_ligand_chain_id not in normalized_map:
-                normalized_map[aligned_ligand_chain_id] = aligned_ligand_smiles
-            if requested_chain and requested_chain not in normalized_map:
-                normalized_map[requested_chain] = aligned_ligand_smiles
+            aligned_ligand_smiles = _canonicalize_smiles_text(aligned_ligand_smiles)
+        output_smiles_map: dict[str, str] = {}
+        if model_ligand_chain_id:
+            resolved_smiles = (
+                aligned_ligand_smiles
+                or input_smiles_map.get(model_ligand_chain_id)
+                or input_smiles_map.get(requested_chain)
+                or ""
+            )
+            if resolved_smiles:
+                output_smiles_map[model_ligand_chain_id] = resolved_smiles
+        elif len(input_smiles_map) == 1:
+            output_smiles_map = dict(input_smiles_map)
 
         selected_ligand_smiles = ""
         if aligned_ligand_smiles:
             selected_ligand_smiles = aligned_ligand_smiles
-        elif requested_chain and normalized_map:
+        elif model_ligand_chain_id and output_smiles_map:
             selected_ligand_smiles = (
-                normalized_map.get(requested_chain)
-                or normalized_map.get(requested_chain.upper())
-                or normalized_map.get(requested_chain.lower())
+                output_smiles_map.get(model_ligand_chain_id)
                 or ""
             )
-        if not selected_ligand_smiles and len(normalized_map) == 1:
-            selected_ligand_smiles = next(iter(normalized_map.values()))
+        elif requested_chain and input_smiles_map:
+            selected_ligand_smiles = (
+                input_smiles_map.get(requested_chain)
+                or input_smiles_map.get(requested_chain.upper())
+                or input_smiles_map.get(requested_chain.lower())
+                or ""
+            )
+        if not selected_ligand_smiles and len(output_smiles_map) == 1:
+            selected_ligand_smiles = next(iter(output_smiles_map.values()))
 
         for conf_path in sorted(struct_dir.glob(f"confidence_{record_id}_model_*.json")):
             try:
@@ -266,23 +290,28 @@ def write_atom_coverage_diagnostics(
             data["chain_atom_coverage"] = coverage["chain_atom_coverage"]
             if model_ligand_chain_id:
                 data["model_ligand_chain_id"] = model_ligand_chain_id
-            if normalized_map:
-                data["ligand_smiles_map"] = normalized_map
+                data["ligand_chain"] = model_ligand_chain_id
+            if output_smiles_map:
+                data["ligand_smiles_map"] = output_smiles_map
             if requested_chain:
                 data["requested_ligand_chain_id"] = requested_chain
+                data["requested_ligand_chain"] = requested_chain
             if selected_ligand_smiles and reference_ligand_mol is None:
                 data["ligand_smiles"] = selected_ligand_smiles
             conf_path.write_text(json.dumps(data, indent=2))
 
         alignment_payload: dict[str, object] = {}
         if selected_ligand_smiles:
+            selected_ligand_smiles = _canonicalize_smiles_text(selected_ligand_smiles)
             alignment_payload["ligand_smiles"] = selected_ligand_smiles
         if model_ligand_chain_id:
             alignment_payload["model_ligand_chain_id"] = model_ligand_chain_id
+            alignment_payload["ligand_chain"] = model_ligand_chain_id
         if requested_chain:
             alignment_payload["requested_ligand_chain_id"] = requested_chain
-        if normalized_map:
-            alignment_payload["ligand_smiles_map"] = normalized_map
+            alignment_payload["requested_ligand_chain"] = requested_chain
+        if output_smiles_map:
+            alignment_payload["ligand_smiles_map"] = output_smiles_map
         if aligned_ligand_atom_name_keys_input_order:
             alignment_payload["ligand_atom_names"] = aligned_ligand_atom_name_keys_input_order
             alignment_payload["ligand_atom_name_keys"] = aligned_ligand_atom_name_keys_input_order

@@ -173,11 +173,10 @@ def _add_output_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_affinity_arguments(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("Affinity")
-    group.add_argument("--target_chain", type=str, default=None, help="Target protein chain ID(s), comma-separated (enables affinity if set with --ligand_chain)")
-    group.add_argument("--ligand_chain", type=str, default=None, help="Ligand chain ID(s), comma-separated (enables affinity if set with --target_chain)")
-    group.add_argument("--affinity_refine", action="store_true", help="Run diffusion refinement before affinity (higher quality, slower).")
-    group.add_argument("--enable_affinity", action="store_true", help="Force affinity prediction (requires both --target_chain and --ligand_chain).")
-    group.add_argument("--auto_enable_affinity", action="store_true", help="Compatibility flag for API clients; affinity runs only when both chains are provided.")
+    group.add_argument("--target_chain", type=str, default=None, help="Target protein chain ID(s), comma-separated. Required with --enable_affinity.")
+    group.add_argument("--ligand_chain", type=str, default=None, help="Ligand chain ID(s), comma-separated. Required with --enable_affinity.")
+    group.add_argument("--affinity_refine", action="store_true", help="When --enable_affinity is set, run diffusion refinement before affinity (higher quality, slower).")
+    group.add_argument("--enable_affinity", action="store_true", help="Enable affinity prediction. Requires both --target_chain and --ligand_chain. Only supported for protein-small-molecule complexes.")
 
 
 def _add_msa_arguments(parser: argparse.ArgumentParser) -> None:
@@ -243,6 +242,8 @@ def _validate_main_args(args: argparse.Namespace, parser: argparse.ArgumentParse
         raise ValueError("--template_exclude_pocket_margin must be non-negative.")
     if args.sigma_max is not None and args.sigma_max <= 0:
         raise ValueError("--sigma_max must be positive.")
+    if args.affinity_refine and not args.enable_affinity:
+        raise ValueError("--affinity_refine requires --enable_affinity.")
 
     has_input = args.input is not None
     has_separate = args.protein_file is not None and args.ligand_file is not None
@@ -280,26 +281,16 @@ def _resolve_sampling_defaults(args: argparse.Namespace) -> tuple[bool, int, int
 def _resolve_affinity_plan(args: argparse.Namespace) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
     target_chains = tuple(_parse_chain_list(args.target_chain))
     ligand_chains = tuple(_parse_chain_list(args.ligand_chain))
-    run_affinity = bool(target_chains) and bool(ligand_chains)
-    if (target_chains or ligand_chains) and not run_affinity:
-        msg = (
-            "Affinity needs both --target_chain and --ligand_chain. "
-            "Skipping affinity and keeping scoring results only."
-        )
-        if args.enable_affinity:
-            raise ValueError(msg)
-        print(
-            "[Warning] "
-            f"{msg} Got target={list(target_chains) or 'none'}, ligand={list(ligand_chains) or 'none'}."
-        )
-    elif args.enable_affinity and not run_affinity:
+    enable_affinity = bool(args.enable_affinity)
+
+    if enable_affinity and (not target_chains or not ligand_chains):
         raise ValueError(
-            "Affinity needs both --target_chain and --ligand_chain. "
+            "Affinity requires both --target_chain and --ligand_chain. "
             "Use both flags or omit --enable_affinity."
         )
-    if run_affinity and set(target_chains) & set(ligand_chains):
+    if enable_affinity and set(target_chains) & set(ligand_chains):
         raise ValueError("Target and ligand chains must be different.")
-    return target_chains, ligand_chains, run_affinity
+    return target_chains, ligand_chains, enable_affinity
 
 
 def _build_job_specs(

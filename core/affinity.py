@@ -3,17 +3,20 @@ from __future__ import annotations
 import json
 import pickle
 from dataclasses import asdict, replace
+from copy import deepcopy
 from pathlib import Path
-from types import MethodType
 
+import torch
 from pytorch_lightning import Trainer, seed_everything
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 from boltz.data import const
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
-from boltz.data.types import AffinityInfo, Manifest, Record, StructureV2
+from boltz.data.types import AffinityInfo, Manifest, Record
 from boltz.data.write.writer import BoltzAffinityWriter
+import boltz.model.loss.diffusionv2 as diffusionv2_loss_mod
+import boltz.model.modules.diffusionv2 as diffusionv2_mod
 from boltz.main import Boltz2DiffusionParams, BoltzSteeringParams, MSAModuleArgs, PairformerArgsV2
 from boltz.model.models.boltz2 import Boltz2
 
@@ -33,6 +36,51 @@ def _load_manifest_record(processed_dir: Path, record_id: str) -> tuple[Manifest
         if record.id == record_id:
             return manifest, record
     raise KeyError(f"Record {record_id!r} not found in {manifest_path}")
+
+
+def inspect_affinity_eligibility(
+    *,
+    processed_dir: Path,
+    record_id: str,
+    requested_ligand_chain_id: str | None,
+) -> dict[str, object]:
+    _, record = _load_manifest_record(processed_dir, record_id)
+    ligand_chains = [
+        chain
+        for chain in record.chains
+        if int(chain.mol_type) == const.chain_type_ids["NONPOLYMER"] and bool(chain.valid)
+    ]
+    available = [str(chain.chain_name).strip() for chain in ligand_chains]
+    if not ligand_chains:
+        return {
+            "eligible": False,
+            "reason": (
+                "No nonpolymer ligand chain found after Boltz preprocessing. "
+                "Affinity prediction is currently enabled only for protein-small-molecule complexes, "
+                "not protein-peptide or protein-protein inputs."
+            ),
+            "available_ligand_chains": available,
+        }
+    if requested_ligand_chain_id:
+        requested = str(requested_ligand_chain_id).strip()
+        matches = [
+            chain
+            for chain in ligand_chains
+            if _chain_name_matches(str(chain.chain_name).strip(), requested)
+        ]
+        if not matches:
+            return {
+                "eligible": False,
+                "reason": (
+                    f"Requested ligand chain {requested!r} did not resolve to a small-molecule chain. "
+                    f"Available small-molecule chains: {available or 'none'}."
+                ),
+                "available_ligand_chains": available,
+            }
+    return {
+        "eligible": True,
+        "available_ligand_chains": available,
+    }
 
 
 def _select_affinity_ligand_chain(
@@ -197,61 +245,98 @@ def _augment_affinity_result(
     if not isinstance(ligand_alignment, dict):
         return result
 
-    aligned_smiles = str(ligand_alignment.get("ligand_smiles") or "").strip()
-    model_chain = str(ligand_alignment.get("model_ligand_chain_id") or "").strip()
-    requested_chain = str(ligand_alignment.get("requested_ligand_chain_id") or "").strip()
-
-    normalized_map: dict[str, str] = {}
-    raw_map = ligand_alignment.get("ligand_smiles_map")
-    if isinstance(raw_map, dict):
-        for key, value in raw_map.items():
-            key_norm = str(key or "").strip()
-            value_norm = str(value or "").strip()
-            if key_norm and value_norm:
-                normalized_map[key_norm] = value_norm
-
-    if aligned_smiles and model_chain and model_chain not in normalized_map:
-        normalized_map[model_chain] = aligned_smiles
-    if aligned_smiles and requested_chain and requested_chain not in normalized_map:
-        normalized_map[requested_chain] = aligned_smiles
-
-    if aligned_smiles:
-        result["ligand_smiles"] = aligned_smiles
-    if model_chain:
-        result["model_ligand_chain_id"] = model_chain
-    if requested_chain:
-        result["requested_ligand_chain_id"] = requested_chain
-        result["requested_ligand_chain"] = requested_chain
-        result["ligand_chain"] = requested_chain
-    if normalized_map:
-        result["ligand_smiles_map"] = normalized_map
+    for key in (
+        "ligand_smiles",
+        "ligand_chain",
+    ):
+        if key in ligand_alignment:
+            result[key] = deepcopy(ligand_alignment[key])
 
     return result
 
 
-def _expand_pre_affinity_coords(feats: dict, multiplicity: int) -> object:
-    coords = feats["coords"]
-    if len(coords.shape) == 4:
-        if coords.shape[1] != 1:
-            raise RuntimeError(
-                "Affinity passthrough currently expects a single pre-affinity conformer. "
-                f"Got coords shape={tuple(coords.shape)}."
-            )
-        coords = coords[:, 0]
-    if len(coords.shape) != 3:
-        raise RuntimeError(f"Unexpected affinity coords shape: {tuple(coords.shape)}")
-    return coords.repeat_interleave(int(multiplicity), dim=0)
+def _stable_weighted_rigid_align(
+    true_coords: torch.Tensor,
+    pred_coords: torch.Tensor,
+    weights: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if mask is None:
+        mask = torch.ones_like(weights, dtype=torch.bool)
+    mask_bool = mask.to(dtype=torch.bool)
+    weight_values = (weights * mask_bool).to(dtype=torch.float64)
+    true_values = true_coords.to(dtype=torch.float64)
+    pred_values = pred_coords.to(dtype=torch.float64)
+
+    batch_size = true_values.shape[0]
+    aligned_batches: list[torch.Tensor] = []
+    for batch_index in range(batch_size):
+        batch_true_all = true_values[batch_index]
+        batch_pred_all = pred_values[batch_index]
+        finite_true = torch.isfinite(batch_true_all).all(dim=-1)
+        finite_pred = torch.isfinite(batch_pred_all).all(dim=-1)
+        valid = mask_bool[batch_index] & finite_true & finite_pred
+
+        fallback_coords = torch.where(
+            torch.isfinite(batch_pred_all),
+            batch_pred_all,
+            torch.where(
+                torch.isfinite(batch_true_all),
+                batch_true_all,
+                torch.zeros_like(batch_true_all),
+            ),
+        )
+
+        if int(valid.sum().item()) < 3:
+            aligned_batches.append(fallback_coords)
+            continue
+
+        batch_weights = weight_values[batch_index, valid]
+        weight_sum = batch_weights.sum()
+        if not torch.isfinite(weight_sum) or float(weight_sum.item()) <= 0:
+            aligned_batches.append(fallback_coords)
+            continue
+
+        batch_true = batch_true_all[valid]
+        batch_pred = batch_pred_all[valid]
+
+        true_centroid = (batch_true * batch_weights[:, None]).sum(dim=0, keepdim=True) / weight_sum
+        pred_centroid = (batch_pred * batch_weights[:, None]).sum(dim=0, keepdim=True) / weight_sum
+        true_centered = batch_true - true_centroid
+        pred_centered = batch_pred - pred_centroid
+
+        cov = (batch_weights[:, None] * pred_centered).transpose(0, 1) @ true_centered
+        cov_cpu = cov.to(device="cpu", dtype=torch.float64)
+        jitter = max(float(cov_cpu.abs().max().item()), 1.0) * 1e-8
+        cov_cpu = cov_cpu + torch.eye(3, dtype=torch.float64) * jitter
+
+        u, _, vh = torch.linalg.svd(cov_cpu, full_matrices=False)
+        rotation = u @ vh
+        if torch.det(rotation) < 0:
+            u[:, -1] *= -1.0
+            rotation = u @ vh
+        rotation = rotation.to(device=true_values.device, dtype=torch.float64)
+
+        full_true = torch.where(
+            finite_true[:, None],
+            batch_true_all,
+            fallback_coords,
+        )
+        aligned = (full_true - true_centroid) @ rotation.transpose(0, 1) + pred_centroid
+        invalid_points = ~(finite_true & finite_pred)
+        if torch.any(invalid_points):
+            aligned[invalid_points] = fallback_coords[invalid_points]
+        aligned_batches.append(aligned)
+
+    return torch.stack(aligned_batches, dim=0).to(dtype=true_coords.dtype, device=true_coords.device)
 
 
-def _install_passthrough_structure_sampler(model_module: Boltz2) -> None:
-    def _passthrough_sample(self, s_trunk, s_inputs, feats, num_sampling_steps, atom_mask, multiplicity, max_parallel_samples, steering_args, diffusion_conditioning):  # noqa: ANN001
-        del self, s_trunk, s_inputs, num_sampling_steps, atom_mask, max_parallel_samples, steering_args, diffusion_conditioning
-        return {
-            "sample_atom_coords": _expand_pre_affinity_coords(feats, int(multiplicity)),
-            "diff_token_repr": None,
-        }
-
-    model_module.structure_module.sample = MethodType(_passthrough_sample, model_module.structure_module)
+def _install_stable_align_patch() -> None:
+    if getattr(diffusionv2_mod, "_boltz2score_stable_align_patch", False):
+        return
+    diffusionv2_mod.weighted_rigid_align = _stable_weighted_rigid_align
+    diffusionv2_loss_mod.weighted_rigid_align = _stable_weighted_rigid_align
+    diffusionv2_mod._boltz2score_stable_align_patch = True
 
 
 def run_affinity_prediction(
@@ -268,6 +353,7 @@ def run_affinity_prediction(
     num_workers: int = 0,
     trainer_precision: int | str | None = None,
     ligand_alignment: dict[str, object] | None = None,
+    no_kernels: bool = False,
 ) -> dict | None:
     if seed is not None:
         seed_everything(seed)
@@ -347,11 +433,10 @@ def run_affinity_prediction(
         pairformer_args=asdict(pairformer_args),
         msa_args=asdict(msa_args),
         steering_args=asdict(steering_args),
-        affinity_mw_correction=True,
-        use_kernels=False,
+        affinity_mw_correction=False,
+        use_kernels=not no_kernels,
     )
     model_module.eval()
-    _install_passthrough_structure_sampler(model_module)
 
     pred_writer = BoltzAffinityWriter(
         data_dir=str(processed_dir / "structures"),
@@ -379,6 +464,7 @@ def run_affinity_prediction(
         "[Info] Running official Boltz2 affinity head "
         f"on pre_affinity coordinates for {record_id}."
     )
+    _install_stable_align_patch()
     trainer.predict(model_module, datamodule=data_module, return_predictions=False)
 
     affinity_result_path = _load_affinity_result_json(output_dir, record_id)

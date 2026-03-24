@@ -7,7 +7,7 @@ from pathlib import Path
 
 from rdkit import Chem
 
-from core.affinity import prepare_affinity_record, run_affinity_prediction
+from core.affinity import inspect_affinity_eligibility, prepare_affinity_record, run_affinity_prediction
 from core.cli import ExecutionPlan, JobSpec
 from core.inference import run_scoring
 from core.results import compute_and_write_ipsae, rerank_diffusion_samples, write_chain_map
@@ -110,7 +110,22 @@ def run_single_job(
         self_template_threshold=args.self_template_threshold,
     )
 
-    if plan.run_affinity:
+    run_affinity = bool(plan.run_affinity)
+
+    if run_affinity:
+        affinity_eligibility = inspect_affinity_eligibility(
+            processed_dir=work_dir / "processed",
+            record_id=record_id,
+            requested_ligand_chain_id=resolved_ligand_chain_id,
+        )
+        if not bool(affinity_eligibility.get("eligible")):
+            run_affinity = False
+            print(
+                "[Warning] Skipping affinity prediction: "
+                f"{affinity_eligibility.get('reason')}"
+            )
+
+    if run_affinity:
         affinity_summary = prepare_affinity_record(
             processed_dir=work_dir / "processed",
             cache_dir=plan.cache_dir,
@@ -228,7 +243,7 @@ def run_single_job(
             f"{rerank_summary['selected_model']} over {rerank_summary['default_writer_model']}."
         )
 
-    if plan.run_affinity:
+    if run_affinity:
         run_affinity_prediction(
             processed_dir=work_dir / "processed",
             output_dir=plan.output_dir,
@@ -242,4 +257,5 @@ def run_single_job(
             num_workers=args.num_workers,
             trainer_precision=args.trainer_precision,
             ligand_alignment=ligand_alignment,
+            no_kernels=args.no_kernels,
         )
